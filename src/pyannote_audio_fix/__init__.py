@@ -3,6 +3,7 @@
 # =========================
 import itertools
 import math
+from string import ascii_uppercase
 import textwrap
 import warnings
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from enum import Enum
 from functools import cached_property, lru_cache
 from io import IOBase
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Text, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Set, Text, Tuple, Union
 
 # =========================
 # Third-Party Imports
@@ -32,6 +33,7 @@ from sklearn.cluster import KMeans
 from asteroid_filterbanks import Encoder, ParamSincFB
 from safetensors.torch import load_file
 import torch_state_bridge as tb
+from torch.utils.data import Dataset, DataLoader
 
 import torchaudio.compliance.kaldi as kaldi
 
@@ -45,8 +47,14 @@ from pyannote.core import (
     SlidingWindowFeature,
 )
 
-from pyannote.core.utils.generators import string_generator
-from pyannote.pipeline.parameter import ParamDict, Uniform
+def string_generator(skip=None):
+    skip = skip or []
+    r = 1
+    while True:
+        for c in itertools.product(ascii_uppercase, repeat=r):
+            if c not in skip: yield ''.join(c)
+        r += 1
+
 import torchaudio
 from tqdm import tqdm
 
@@ -141,9 +149,9 @@ class VBxClustering:
     expects_num_clusters = False
     metric = 'cosine'
     constrained_assignment = True
-    threshold = Uniform(0.5, 0.8)
-    Fa = Uniform(0.01, 0.5)
-    Fb = Uniform(0.01, 15.0)
+    threshold = 0.6
+    Fa = 0.07
+    Fb = 0.8
 
     def __init__(self,plda):
         self.plda = plda
@@ -823,7 +831,6 @@ class Inference:
         self,
         file,
         chunk: Union[Segment, List[Segment]],
-        hook: Optional[Callable] = None,
     ) -> Union[
         Tuple[Union[SlidingWindowFeature, np.ndarray]],
         Union[SlidingWindowFeature, np.ndarray],
@@ -836,7 +843,7 @@ class Inference:
 
             waveform, sample_rate = self.model.audio.crop(file, chunk)
             outputs: SlidingWindowFeature | tuple[SlidingWindowFeature] = (
-                self.slide(waveform, sample_rate, hook=hook)
+                self.slide(waveform, sample_rate)
             )
 
             def __shift(output: SlidingWindowFeature, **kwargs) -> SlidingWindowFeature:
@@ -1240,41 +1247,6 @@ class PLDA:
     def __call__(self, emb: np.ndarray):
         return self._plda_tf(self._xvec_tf(emb), self.lda_dimension)
 
-@dataclass
-class DiarizeOutput:
-    speaker_diarization: Annotation
-    exclusive_speaker_diarization: Annotation
-    speaker_embeddings: np.ndarray | None = None
-
-
-    def serialize(self) -> dict[str, Any]:
-        diarization = []
-        for speech_turn, _, speaker in self.speaker_diarization.itertracks(
-            yield_label=True
-        ):
-            diarization.append(
-                {
-                    "start": round(speech_turn.start, 3),
-                    "end": round(speech_turn.end, 3),
-                    "speaker": speaker,
-                }
-            )
-
-        exclusive_diarization = []
-        for speech_turn, _, speaker in self.exclusive_speaker_diarization.itertracks(yield_label=True):
-            exclusive_diarization.append(
-                {
-                    "start": round(speech_turn.start, 3),
-                    "end": round(speech_turn.end, 3),
-                    "speaker": speaker,
-                }
-            )
-
-        return {
-            "diarization": diarization,
-            "exclusive_diarization": exclusive_diarization,
-        }
-
 
 
 
@@ -1417,7 +1389,11 @@ class WeSpeakerResNet34(nn.Module):
     def compute_fbank(self, waveforms: torch.Tensor) -> torch.Tensor:
         waveforms = waveforms * (1 << 15)
         device = waveforms.device
-        features = torch.vmap(kaldi.fbank)(waveforms, num_mel_bins=self.hparams['num_mel_bins'], window_type="hamming").to(device)
+        features = torch.vmap(kaldi.fbank)(
+            waveforms.unsqueeze(1),   # ← yahi fix hai
+            num_mel_bins=self.hparams['num_mel_bins'],
+            window_type="hamming"
+        ).to(device)
         return features - torch.mean(features, dim=1, keepdim=True)
 
     def forward(self, waveforms: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1488,14 +1464,76 @@ class WeSpeakerResNet34(nn.Module):
 
 
 
+class EmbeddingDataset(Dataset):
+    def __init__(
+        self,
+        file,
+        binary_segmentations: SlidingWindowFeature,
+        clean_segmentations: SlidingWindowFeature,
+        audio: Audio,
+        min_num_frames: int = -1,
+    ):
+        self.min_num_frames = min_num_frames
+        self.sliding_window = binary_segmentations.sliding_window
+        self.seg_data = binary_segmentations.data
+        self.clean_data = clean_segmentations.data
+
+        num_chunks, _, num_speakers = self.seg_data.shape
+        self.indices = [
+            (c, s)
+            for c in range(num_chunks)
+            for s in range(num_speakers)
+        ]
+
+        # ✅ Poori audio EK baar load karo RAM mein
+        self.waveform, self.sample_rate = audio(file)  # (1, total_samples)
+        self.window_size = audio.get_num_samples(
+            self.sliding_window.duration, self.sample_rate
+        )
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        chunk_idx, speaker_idx = self.indices[idx]
+
+        # Disk I/O nahi — seedha RAM se slice!
+        start_sample = round(
+            self.sliding_window[chunk_idx].start * self.sample_rate
+        )
+        end_sample = start_sample + self.window_size
+        
+        # Pad if needed (last chunk)
+        waveform = self.waveform[:, start_sample:end_sample]  # (1, window_size)
+        if waveform.shape[1] < self.window_size:
+            waveform = F.pad(waveform, (0, self.window_size - waveform.shape[1]))
+
+        mask = self.seg_data[chunk_idx, :, speaker_idx]
+        clean_mask = self.clean_data[chunk_idx, :, speaker_idx]
+
+        mask = np.nan_to_num(mask, nan=0.0).astype(np.float32)
+        clean_mask = np.nan_to_num(clean_mask, nan=0.0).astype(np.float32)
+
+        used_mask = (
+            clean_mask
+            if np.sum(clean_mask) > self.min_num_frames
+            else mask
+        )
+
+        return (
+            waveform.squeeze(0),             # (window_size,)
+            torch.from_numpy(used_mask),     # (num_frames,)
+            chunk_idx,
+            speaker_idx,
+        )
 
 class SpeakerDiarization(nn.Module):
     def __init__(
         self,
         segmentation_step: float = 0.1,
-        embedding_exclude_overlap: bool = False,
-        embedding_batch_size: int = 1,
-        segmentation_batch_size: int = 1,
+        embedding_exclude_overlap: bool = True,
+        embedding_batch_size: int = 32,
+        segmentation_batch_size: int = 32,
         der_variant: Optional[dict] = None,
     ):
         super().__init__()
@@ -1515,17 +1553,6 @@ class SpeakerDiarization(nn.Module):
             batch_size=segmentation_batch_size,
         )
 
-        if self._segmentation_model.specifications.powerset:
-            self.segmentation = ParamDict(
-                min_duration_off=Uniform(0.0, 1.0),
-            )
-
-        else:
-            self.segmentation = ParamDict(
-                threshold=Uniform(0.1, 0.9),
-                min_duration_off=Uniform(0.0, 1.0),
-            )
-
         self._audio = Audio(16000, "downmix")
         self.clustering = VBxClustering(self._plda)
         self._expects_num_speakers = self.clustering.expects_num_clusters
@@ -1536,7 +1563,7 @@ conv1d,layers.conv
 .norm1d,.layers.norm
 """))
         self._embedding.load_state_dict(load_file(hf_hub_download("shethjenil/speaker-diarization","embedding.safetensors")))
-        
+        self.eval()
     @property
     def segmentation_batch_size(self) -> int:
         return self._segmentation.batch_size
@@ -1544,12 +1571,6 @@ conv1d,layers.conv
     @segmentation_batch_size.setter
     def segmentation_batch_size(self, batch_size: int):
         self._segmentation.batch_size = batch_size
-
-    def default_parameters(self):
-        return {
-            "segmentation": {"min_duration_off": 0.0},
-            "clustering": {"threshold": 0.6, "Fa": 0.07, "Fb": 0.8},
-        }
 
     def classes(self):
         speaker = 0
@@ -1565,12 +1586,13 @@ conv1d,layers.conv
             middle = (lower + upper) // 2
             while lower + 1 < upper:
                 try:
-                    _ = self.model_(torch.randn(1, 1, middle).to(device))
+                    _ = self._embedding(torch.randn(1, 1, middle).to(device))
                     upper = middle
                 except Exception:
                     lower = middle
                 middle = (lower + upper) // 2
         return upper
+
 
     def get_embeddings(
         self,
@@ -1578,10 +1600,13 @@ conv1d,layers.conv
         binary_segmentations: SlidingWindowFeature,
         exclude_overlap: bool = False,
     ):
-        duration = binary_segmentations.sliding_window.duration
-        num_chunks, num_frames, _ = binary_segmentations.data.shape
+        device = next(self.parameters()).device
+        num_chunks, num_frames, num_speakers = binary_segmentations.data.shape
+
+        # --- Clean segmentations ---
         if exclude_overlap:
             min_num_samples = self._embedding_min_num_samples
+            duration = binary_segmentations.sliding_window.duration
             num_samples = duration * self._audio.sample_rate
             min_num_frames = math.ceil(num_frames * min_num_samples / num_samples)
             clean_frames = 1.0 * (
@@ -1591,60 +1616,52 @@ conv1d,layers.conv
                 binary_segmentations.data * clean_frames,
                 binary_segmentations.sliding_window,
             )
-
         else:
             min_num_frames = -1
             clean_segmentations = SlidingWindowFeature(
-                binary_segmentations.data, binary_segmentations.sliding_window
+                binary_segmentations.data.copy(),
+                binary_segmentations.sliding_window,
             )
 
-        def iter_waveform_and_mask():
-            for (chunk, masks), (_, clean_masks) in zip(
-                binary_segmentations, clean_segmentations
-            ):
-                # chunk: Segment(t, t + duration)
-                # masks: (num_frames, local_num_speakers) np.ndarray
-
-                waveform, _ = self._audio.crop(
-                    file,
-                    chunk,
-                    mode="pad",
-                )
-                # waveform: (1, num_samples) torch.Tensor
-
-                # mask may contain NaN (in case of partial stitching)
-                masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
-                clean_masks = np.nan_to_num(clean_masks, nan=0.0).astype(np.float32)
-
-                for mask, clean_mask in zip(masks.T, clean_masks.T):
-                    # mask: (num_frames, ) np.ndarray
-
-                    if np.sum(clean_mask) > min_num_frames:
-                        used_mask = clean_mask
-                    else:
-                        used_mask = mask
-
-                    yield waveform[None], torch.from_numpy(used_mask)[None]
-                    # w: (1, 1, num_samples) torch.Tensor
-                    # m: (1, num_frames) torch.Tensor
-
-        batches = batchify(
-            iter_waveform_and_mask(),
-            batch_size=self.embedding_batch_size,
-            fillvalue=(None, None),
+        # --- Dataset + DataLoader ---
+        dataset = EmbeddingDataset(
+            file=file,
+            binary_segmentations=binary_segmentations,
+            clean_segmentations=clean_segmentations,
+            audio=self._audio,
+            min_num_frames=min_num_frames,
         )
-        embedding_batches = []
-        for batch in tqdm(batches,total=math.ceil(num_chunks * binary_segmentations.data.shape[2] / self.embedding_batch_size)):
-            waveforms, masks = zip(*filter(lambda b: b[0] is not None, batch))
-            waveform_batch = torch.vstack(waveforms)
-            mask_batch = torch.vstack(masks)
-            embedding_batch: np.ndarray = self._embedding(
-                waveform_batch, mask_batch
-            )
-            embedding_batches.append(embedding_batch)
-        embedding_batches = np.vstack(embedding_batches)
-        embeddings = rearrange(embedding_batches, "(c s) d -> c s d", c=num_chunks)
-        return embeddings
+
+        loader = DataLoader(
+            dataset,
+            batch_size=self.embedding_batch_size,
+            pin_memory=True,
+        )
+
+        # --- Inference ---
+        # Preallocate karo — seedha sahi shape mein
+        embeddings = np.zeros(
+            (num_chunks, num_speakers, self._embedding.dimension),
+            dtype=np.float32,
+        )
+
+        for waveforms, masks, chunk_idxs, speaker_idxs in tqdm(
+            loader,
+            desc="Embedding",
+            total=len(loader),
+        ):
+            waveforms = waveforms.to(device)  # (B, N) — sahi shape
+            masks = masks.to(device)                        # (B, num_frames)
+
+            batch_embeddings = self._embedding(
+                waveforms, masks
+            )  # (B, dimension)
+            batch_embeddings = batch_embeddings.cpu().numpy()
+            embeddings[chunk_idxs.numpy(), speaker_idxs.numpy()] = batch_embeddings
+
+
+        return embeddings  # (num_chunks, num_speakers, dimension) — rearrange bhi nahi chahiye!
+
 
     def reconstruct(
         self,
@@ -1731,14 +1748,14 @@ conv1d,layers.conv
         count.data = np.rint(count.data).astype(np.uint8)
         return count
 
-
+    @torch.inference_mode()
     def forward(
         self,
         file: AudioFile,
         num_speakers: Optional[int] = None,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
-    ) -> DiarizeOutput | Annotation:
+    ):
         num_speakers, min_speakers, max_speakers = set_num_speakers(
             num_speakers=num_speakers,
             min_speakers=min_speakers,
@@ -1754,7 +1771,6 @@ conv1d,layers.conv
         else:
             binarized_segmentations: SlidingWindowFeature = binarize(
                 segmentations,
-                onset=self.segmentation.threshold,
                 initial_state=False,
             )
         count = self.speaker_count(
@@ -1763,13 +1779,7 @@ conv1d,layers.conv
             warm_up=(0.0, 0.0),
         )
         if np.nanmax(count.data) == 0.0:
-            output = DiarizeOutput(
-                speaker_diarization=Annotation(uri=file["uri"]),
-                exclusive_speaker_diarization=Annotation(uri=file["uri"]),
-                speaker_embeddings=np.zeros((0, self._embedding.dimension)),
-            )
-
-            return output
+            return
 
         embeddings = self.get_embeddings(
             file,
@@ -1782,8 +1792,6 @@ conv1d,layers.conv
             num_clusters=num_speakers,
             min_clusters=min_speakers,
             max_clusters=max_speakers,
-            file=file,  # <== for oracle clustering
-            frames=self._segmentation.model.receptive_field,  # <== for oracle clustering
         )
         num_different_speakers = np.max(hard_clusters) + 1
         if (
@@ -1811,41 +1819,25 @@ conv1d,layers.conv
         diarization = self.to_annotation(
             discrete_diarization,
             min_duration_on=0.0,
-            min_duration_off=self.segmentation.min_duration_off,
         )
-        diarization.uri = file["uri"]
         count.data = np.minimum(count.data, 1).astype(np.int8)
         exclusive_discrete_diarization = self.reconstruct(
             segmentations,
             hard_clusters,
             count,
         )
-        exclusive_diarization = self.to_annotation(
-            exclusive_discrete_diarization,
-            min_duration_on=0.0,
-            min_duration_off=self.segmentation.min_duration_off,
-        )
-        exclusive_diarization.uri = file["uri"]
-        if "annotation" in file and file["annotation"]:
-            _, mapping = self.optimal_mapping(
-                file["annotation"], diarization, return_mapping=True
-            )
-            mapping = {key: mapping.get(key, key) for key in diarization.labels()}
-        else:
-            mapping = {
-                label: expected_label
-                for label, expected_label in zip(diarization.labels(), self.classes())
-            }
+        exclusive_diarization = self.to_annotation(exclusive_discrete_diarization,)
+        mapping = {
+            label: expected_label
+            for label, expected_label in zip(diarization.labels(), self.classes())
+        }
         diarization = diarization.rename_labels(mapping=mapping)
         exclusive_diarization = exclusive_diarization.rename_labels(mapping=mapping)
         if centroids is None:
-            output = DiarizeOutput(
-                speaker_diarization=diarization,
-                exclusive_speaker_diarization=exclusive_diarization,
-                speaker_embeddings=centroids,
-            )
-
-            return output
+            return {
+            "diarization":[{"start":i.start,"end":i.end,"speaker":int(s.replace("SPEAKER_",""))} for i,_,s in diarization.itertracks(True)],
+            "exclusive_diarization":[{"start":i.start,"end":i.end,"speaker":int(s.replace("SPEAKER_",""))} for i,_,s in exclusive_diarization.itertracks(True)],
+            }
         if len(diarization.labels()) > centroids.shape[0]:
             centroids = np.pad(
                 centroids, ((0, len(diarization.labels()) - centroids.shape[0]), (0, 0))
@@ -1854,12 +1846,10 @@ conv1d,layers.conv
         centroids = centroids[
             [inverse_mapping[label] for label in diarization.labels()]
         ]
-
-        output = DiarizeOutput(
-            speaker_diarization=diarization,
-            exclusive_speaker_diarization=exclusive_diarization,
-            speaker_embeddings=centroids,
-        )
-
-        return output
+        
+        return {
+            "diarization":[{"start":i.start,"end":i.end,"speaker":int(s.replace("SPEAKER_",""))} for i,_,s in diarization.itertracks(True)],
+            "exclusive_diarization":[{"start":i.start,"end":i.end,"speaker":int(s.replace("SPEAKER_",""))} for i,_,s in exclusive_diarization.itertracks(True)],
+            "speaker_embeddings":centroids
+        }
 
