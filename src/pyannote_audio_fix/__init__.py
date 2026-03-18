@@ -2,20 +2,18 @@ import itertools
 import math
 import textwrap
 import warnings
-import random
 import numpy as np
 import scipy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
 import torch_state_bridge as tb
 from string import ascii_uppercase
 from dataclasses import dataclass
 from enum import Enum
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Text, Tuple, Union
+from typing import Callable, Dict, List, Optional, Text, Tuple, Union
 from tqdm import tqdm
 from einops import rearrange
 from huggingface_hub import hf_hub_download
@@ -36,6 +34,7 @@ from pyannote.core import (
     SlidingWindowFeature,
 )
 
+SAMPLE_RATE = 16000
 def string_generator():
     r = 1
     while True:
@@ -240,7 +239,7 @@ class VBxClustering:
     def filter_embeddings(
         self,
         embeddings: np.ndarray,
-        segmentations: SlidingWindowFeature | None = None,
+        segmentations: SlidingWindowFeature,
         min_active_ratio: float = 0.2,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         _, num_frames, _ = segmentations.data.shape
@@ -451,16 +450,13 @@ def run_multi_conv(val, ks, ss, ps, ds, func, reverse=False):
 
 # --- SincNet ---
 class SincNet(nn.Module):
-    def __init__(self, sample_rate: int = 16000, stride: int = 1):
+    def __init__(self, stride: int = 10):
         super().__init__()
-        if sample_rate != 16000: raise NotImplementedError("SincNet only supports 16kHz.")
-        self.sample_rate, self.stride = sample_rate, stride
+        self.stride = stride
         self.wav_norm1d = nn.InstanceNorm1d(1, affine=True)
-
-        # Layers: (in_channels, out_channels, kernel, stride)
         self.layers = nn.ModuleDict({
             "conv": nn.ModuleList([
-                Encoder(ParamSincFB(80, 251, stride=stride, sample_rate=sample_rate, min_low_hz=50, min_band_hz=50)),
+                Encoder(ParamSincFB(80, 251, 10)),
                 nn.Conv1d(80, 60, 5, stride=1),
                 nn.Conv1d(60, 60, 5, stride=1)
             ]),
@@ -491,59 +487,24 @@ class SincNet(nn.Module):
 
 # --- PyanNet ---
 class PyanNet(nn.Module):
-    DEFAULTS = {
-        "sincnet": {"stride": 10},
-        "lstm": {"hidden_size": 128, "num_layers": 4, "bidirectional": True, "monolithic": True, "dropout": 0.0},
-        "linear": {"hidden_size": 128, "num_layers": 2}
-    }
-
-    def __init__(self, sincnet=None, lstm=None, linear=None, sample_rate=16000, specifications:Specifications=None):
+    def __init__(self,specifications:Specifications=None):
         super().__init__()
         self.specifications = specifications
-        s_cfg = {**self.DEFAULTS["sincnet"], **(sincnet or {})}
-        l_cfg = {**self.DEFAULTS["lstm"], **(lstm or {})}
-        lin_cfg = {**self.DEFAULTS["linear"], **(linear or {})}
-        
-        self.sincnet = SincNet(sample_rate=sample_rate, stride=s_cfg["stride"])
-        self.l_cfg = l_cfg
-        
-        # LSTM
-        lstm_in, out_f = 60, l_cfg["hidden_size"] * (2 if l_cfg["bidirectional"] else 1)
-        if l_cfg["monolithic"]:
-            self.lstm = nn.LSTM(lstm_in, l_cfg["hidden_size"], l_cfg["num_layers"], bidirectional=l_cfg["bidirectional"], batch_first=True, dropout=l_cfg["dropout"])
-        else:
-            self.lstm = nn.ModuleList([nn.LSTM(lstm_in if i==0 else out_f, l_cfg["hidden_size"], 1, bidirectional=l_cfg["bidirectional"], batch_first=True) for i in range(l_cfg["num_layers"])])
-            self.dropout = nn.Dropout(l_cfg["dropout"])
+        self.sincnet = SincNet()
+        self.lstm = nn.LSTM(60, 128, 4, bidirectional=True, batch_first=True)
+        self.linears = nn.ModuleList([nn.Linear(128*2 if i==0 else 128, 128) for i in range(2)])
+        self.classifier = nn.Linear(128, self.dimension)
 
-        # Linear & Classifier
-        self.linears = nn.ModuleList([nn.Linear(out_f if i==0 else lin_cfg["hidden_size"], lin_cfg["hidden_size"]) for i in range(lin_cfg["num_layers"])])
-        self.classifier = nn.Linear(lin_cfg["hidden_size"] if lin_cfg["num_layers"] > 0 else out_f, self.dimension)
-        self.audio = Audio(sample_rate=self.sincnet.sample_rate, mono="downmix")
     @property
     def dimension(self) -> int:
         return self.specifications.num_powerset_classes if getattr(self.specifications, 'powerset', False) else len(self.specifications.classes)
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         outputs = rearrange(self.sincnet(waveforms), "batch feature frame -> batch frame feature")
-        
-        if self.l_cfg["monolithic"]:
-            outputs, _ = self.lstm(outputs)
-        else:
-            for i, layer in enumerate(self.lstm):
-                outputs, _ = layer(outputs)
-                if i + 1 < self.l_cfg["num_layers"]: outputs = self.dropout(outputs)
-
+        outputs, _ = self.lstm(outputs)
         for lin in self.linears:
             outputs = F.leaky_relu(lin(outputs))
-            
-        return self.activation_logic(outputs)
-
-    def activation_logic(self, x):
-        # Exact logic based on problem type
-        spec = self.specifications
-        if spec.problem == Problem.BINARY_CLASSIFICATION: return torch.sigmoid(self.classifier(x))
-        if spec.problem == Problem.MONO_LABEL_CLASSIFICATION: return F.log_softmax(self.classifier(x), dim=-1)
-        return torch.sigmoid(self.classifier(x))
+        return F.log_softmax(self.classifier(outputs), dim=-1)
 
     def num_frames(self, n): return self.sincnet.num_frames(n)
     def receptive_field_size(self, n=1): return self.sincnet.receptive_field_size(n)
@@ -581,7 +542,7 @@ class Inference:
         specifications = self.model.specifications
         self.duration = duration
         self.skip_conversion = skip_conversion
-        conversion = [conversion.append(Powerset(len(s.classes), s.powerset_max_classes) if s.powerset and not skip_conversion else nn.Identity()) for s in specifications]
+        conversion = [Powerset(len(s.classes), s.powerset_max_classes) if s.powerset and not skip_conversion else nn.Identity() for s in specifications]
         if isinstance(specifications, Specifications):
             self.conversion = conversion[0]
         else:
@@ -606,11 +567,11 @@ class Inference:
     ) -> Union[SlidingWindowFeature, Tuple[SlidingWindowFeature]]:
         device = next(self.model.parameters()).device
         self.conversion.to(device)
-        window_size: int = self.model.audio.get_num_samples(self.duration)
+        window_size: int = self.duration * SAMPLE_RATE
         step_size: int = round(self.step * sample_rate)
         _, num_samples = waveform.shape
         specs = self.model.specifications
-        frames = SlidingWindow(0.0, self.duration, self.step) if specs.resolution == Resolution.CHUNK else self.model.receptive_field
+        frames = self.model.receptive_field
         if num_samples >= window_size:
             chunks: torch.Tensor = rearrange(
                 waveform.unfold(1, window_size, step_size),
@@ -661,20 +622,6 @@ class Inference:
                     Segment(0.0, num_samples / sample_rate), mode="loose"
                 )
         return result
-    def crop(
-        self,
-        file,
-        chunk: Union[Segment, List[Segment]],
-    ):
-        if not isinstance(chunk, Segment):
-            chunk = Segment(start=min(c.start for c in chunk), end=max(c.end for c in chunk))
-        waveform, sample_rate = self.model.audio.crop(file, chunk)
-        outputs = self.slide(waveform, sample_rate)
-        return SlidingWindowFeature(outputs.data, SlidingWindow(
-            start=chunk.start,
-            duration=outputs.sliding_window.duration,
-            step=outputs.sliding_window.step,
-        ))
 
     @staticmethod
     def aggregate(
@@ -816,162 +763,34 @@ class Inference:
         return self.slide(waveform, sample_rate)
 
 
+def detect_segments(scores, onset=0.5, offset=None):
+    offset = onset if offset is None else offset
 
+    data = scores.data
+    timestamps = [scores.sliding_window[i].middle for i in range(len(data))]
 
+    result = Annotation()
+    track_gen = string_generator()
 
-class Audio:
-    def __init__(self, sample_rate: int = None, mono: str = None):
-        self.sample_rate = sample_rate
-        self.mono = mono
+    for i, cls_scores in enumerate(data.T):
+        label = i if scores.labels is None else scores.labels[i]
+        track = next(track_gen)
 
-    def downmix_and_resample(
-        self, waveform: torch.Tensor, sample_rate: int, channel: int | None = None
-    ) -> Tuple[torch.Tensor, int]:
-        if channel is not None:
-            waveform = waveform[channel : channel + 1]
+        active = cls_scores[0] > onset
+        start = timestamps[0]
 
-        if waveform.shape[0] > 1:
-            if self.mono == "downmix":
-                waveform = waveform.mean(dim=0, keepdim=True)
-            elif self.mono == "random":
-                ch = random.randint(0, waveform.shape[0] - 1)
-                waveform = waveform[ch : ch + 1]
+        for t, val in zip(timestamps[1:], cls_scores[1:]):
+            if active and val < offset:
+                result[Segment(start, t), track] = label
+                active = False
+            elif not active and val > onset:
+                start = t
+                active = True
 
-        if (self.sample_rate is not None) and (self.sample_rate != sample_rate):
-            waveform = torchaudio.functional.resample(waveform, sample_rate, self.sample_rate)
-            sample_rate = self.sample_rate
+        if active:
+            result[Segment(start, timestamps[-1]), track] = label
 
-        return waveform, sample_rate
-
-    def get_num_samples(self, duration: float, sample_rate: int = None) -> int:
-            sr = sample_rate or self.sample_rate
-            if sr is None:
-                raise ValueError("`sample_rate` is required to compute number of samples.")
-            return int(round(duration * sr))
-
-    def crop(
-        self,
-        file: Union[str, Path, Mapping],
-        segment: any,
-        mode: str = "raise"
-    ) -> Tuple[torch.Tensor, int]:
-        
-        path = file["audio"] if isinstance(file, Mapping) else str(file)
-        channel = file.get("channel") if isinstance(file, Mapping) else None
-
-        # Load first few samples just to get the sample rate
-        # This is a fallback if .info is broken
-        temp_waveform, sr = torchaudio.load(path, frame_offset=0, num_frames=1)
-        
-        start_frame = int(round(segment.start * sr))
-        num_frames = self.get_num_samples(segment.duration, sr)
-
-        # Load actual chunk
-        waveform, original_sr = torchaudio.load(
-            path, 
-            frame_offset=max(0, start_frame), 
-            num_frames=num_frames
-        )
-
-        if mode == "raise":
-            if segment.start < 0:
-                raise ValueError(f"Negative start time: {segment.start}")
-            
-            # Strict length check
-            if waveform.shape[1] < num_frames and start_frame >= 0:
-                # If we got less than requested, it means we hit EOF
-                raise ValueError(f"Requested segment ends after file duration.")
-
-        # If mode is "pad" or we didn't raise, fill the gap
-        if waveform.shape[1] < num_frames:
-            waveform = F.pad(waveform, (0, num_frames - waveform.shape[1]))
-
-        return self.downmix_and_resample(waveform, original_sr, channel=channel)
-
-    def __call__(self, file: Union[str, Path, Mapping]) -> Tuple[torch.Tensor, int]:
-        if isinstance(file, Mapping) and "waveform" in file:
-             return self.downmix_and_resample(file["waveform"], file["sample_rate"], file.get("channel"))
-        
-        path = file["audio"] if isinstance(file, Mapping) else str(file)
-        channel = file.get("channel") if isinstance(file, Mapping) else None
-        
-        waveform, sr = torchaudio.load(path)
-        return self.downmix_and_resample(waveform, sr, channel=channel)
-
-
-
-class Binarize:
-    def __init__(
-        self,
-        onset: float = 0.5,
-        offset: Optional[float] = None,
-        min_duration_on: float = 0.0,
-        min_duration_off: float = 0.0,
-        pad_onset: float = 0.0,
-        pad_offset: float = 0.0,
-    ):
-
-        super().__init__()
-
-        self.onset = onset
-        self.offset = offset or onset
-
-        self.pad_onset = pad_onset
-        self.pad_offset = pad_offset
-
-        self.min_duration_on = min_duration_on
-        self.min_duration_off = min_duration_off
-
-    def __call__(self, scores: SlidingWindowFeature) -> Annotation:
-        num_frames, num_classes = scores.data.shape
-        frames = scores.sliding_window
-        timestamps = [frames[i].middle for i in range(num_frames)]
-        active = Annotation()
-        track_generator = string_generator()
-
-        for k, k_scores in enumerate(scores.data.T):
-            label = k if scores.labels is None else scores.labels[k]
-            track = next(track_generator)
-
-            # initial state
-            start = timestamps[0]
-            is_active = k_scores[0] > self.onset
-
-            for t, y in zip(timestamps[1:], k_scores[1:]):
-
-                # currently active
-                if is_active:
-                    # switching from active to inactive
-                    if y < self.offset:
-                        region = Segment(start - self.pad_onset, t + self.pad_offset)
-                        active[region, track] = label
-                        start = t
-                        is_active = False
-
-                # currently inactive
-                else:
-                    # switching from inactive to active
-                    if y > self.onset:
-                        start = t
-                        is_active = True
-
-            # if active at the end, add final region
-            if is_active:
-                region = Segment(start - self.pad_onset, t + self.pad_offset)
-                active[region, track] = label
-
-        # because of padding, some active regions might be overlapping: merge them.
-        # also: fill same speaker gaps shorter than min_duration_off
-        if self.pad_offset > 0.0 or self.pad_onset > 0.0 or self.min_duration_off > 0.0:
-            active = active.support(collar=self.min_duration_off)
-
-        # remove tracks shorter than min_duration_on
-        if self.min_duration_on > 0:
-            for segment, track in list(active.itertracks()):
-                if segment.duration < self.min_duration_on:
-                    del active[segment, track]
-
-        return active
+    return result
 
 def set_num_speakers(
     num_speakers: Optional[int] = None,
@@ -1146,7 +965,7 @@ class WeSpeakerResNet34(nn.Module):
         ).to(wav.device)
 
         feat = feat - feat.mean(dim=1, keepdim=True)
-        return self.resnet(feat, weights=weights)[1]
+        return self.resnet(feat, weights=weights)
 
 
 
@@ -1207,10 +1026,9 @@ class WeSpeakerResNet34(nn.Module):
 class EmbeddingDataset(Dataset):
     def __init__(
         self,
-        file,
+        wav,
         binary_segmentations: SlidingWindowFeature,
         clean_segmentations: SlidingWindowFeature,
-        audio: Audio,
         min_num_frames: int = -1,
     ):
         self.min_num_frames = min_num_frames
@@ -1225,11 +1043,8 @@ class EmbeddingDataset(Dataset):
             for s in range(num_speakers)
         ]
 
-        # ✅ Poori audio EK baar load karo RAM mein
-        self.waveform, self.sample_rate = audio(file)  # (1, total_samples)
-        self.window_size = audio.get_num_samples(
-            self.sliding_window.duration, self.sample_rate
-        )
+        self.waveform = wav
+        self.window_size = int(self.sliding_window.duration) * SAMPLE_RATE
 
     def __len__(self):
         return len(self.indices)
@@ -1239,7 +1054,7 @@ class EmbeddingDataset(Dataset):
 
         # Disk I/O nahi — seedha RAM se slice!
         start_sample = round(
-            self.sliding_window[chunk_idx].start * self.sample_rate
+            self.sliding_window[chunk_idx].start * SAMPLE_RATE
         )
         end_sample = start_sample + self.window_size
         
@@ -1276,7 +1091,7 @@ class SpeakerDiarization(nn.Module):
         der_variant: Optional[dict] = None,
     ):
         super().__init__()
-        self._segmentation_model = PyanNet(specifications=Specifications(Problem.MONO_LABEL_CLASSIFICATION, Resolution.FRAME, 10.0,classes=['speaker#1', 'speaker#2', 'speaker#3'], powerset_max_classes=2, permutation_invariant=True))
+        self._segmentation_model = PyanNet(specifications=Specifications(None,None, 10.0,classes=['speaker#1', 'speaker#2', 'speaker#3'], powerset_max_classes=2, permutation_invariant=True))
         self._embedding = WeSpeakerResNet34()
         self.segmentation_step = segmentation_step
         self.embedding_batch_size = embedding_batch_size
@@ -1291,7 +1106,6 @@ class SpeakerDiarization(nn.Module):
             skip_aggregation=True,
         )
 
-        self._audio = Audio(16000, "downmix")
         self.clustering = VBxClustering(self._plda)
         self._expects_num_speakers = self.clustering.expects_num_clusters
 
@@ -1320,7 +1134,7 @@ conv1d,layers.conv
     def _embedding_min_num_samples(self) -> int:
         with torch.inference_mode():
             device = next(self.parameters()).device
-            lower, upper = 2, round(0.5 * self._audio.sample_rate)
+            lower, upper = 2, round(0.5 * SAMPLE_RATE)
             middle = (lower + upper) // 2
             while lower + 1 < upper:
                 try:
@@ -1334,7 +1148,7 @@ conv1d,layers.conv
 
     def get_embeddings(
         self,
-        file,
+        wav,
         binary_segmentations: SlidingWindowFeature,
         exclude_overlap: bool = False,
     ):
@@ -1345,7 +1159,7 @@ conv1d,layers.conv
         if exclude_overlap:
             min_num_samples = self._embedding_min_num_samples
             duration = binary_segmentations.sliding_window.duration
-            num_samples = duration * self._audio.sample_rate
+            num_samples = duration * SAMPLE_RATE
             min_num_frames = math.ceil(num_frames * min_num_samples / num_samples)
             clean_frames = 1.0 * (
                 np.sum(binary_segmentations.data, axis=2, keepdims=True) < 2
@@ -1363,10 +1177,9 @@ conv1d,layers.conv
 
         # --- Dataset + DataLoader ---
         dataset = EmbeddingDataset(
-            file=file,
+            wav=wav,
             binary_segmentations=binary_segmentations,
             clean_segmentations=clean_segmentations,
-            audio=self._audio,
             min_num_frames=min_num_frames,
         )
 
@@ -1421,21 +1234,6 @@ conv1d,layers.conv
         )
         return self.to_diarization(clustered_segmentations, count)
 
-
-    @staticmethod
-    def to_annotation(
-        discrete_diarization: SlidingWindowFeature,
-        min_duration_on: float = 0.0,
-        min_duration_off: float = 0.0,
-    ) -> Annotation:
-        binarize = Binarize(
-            onset=0.5,
-            offset=0.5,
-            min_duration_on=min_duration_on,
-            min_duration_off=min_duration_off,
-        )
-        return binarize(discrete_diarization)
-
     @staticmethod
     def to_diarization(
         segmentations: SlidingWindowFeature,
@@ -1484,7 +1282,7 @@ conv1d,layers.conv
     @torch.inference_mode()
     def forward(
         self,
-        file,
+        wav,
         num_speakers: Optional[int] = None,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
@@ -1494,7 +1292,7 @@ conv1d,layers.conv
             min_speakers=min_speakers,
             max_speakers=max_speakers,
         )
-        segmentations = self._segmentation(file)
+        segmentations = self._segmentation(wav)
         if self._segmentation_model.specifications.powerset:
             binarized_segmentations = segmentations
         else:
@@ -1511,7 +1309,7 @@ conv1d,layers.conv
             return
 
         embeddings = self.get_embeddings(
-            file,
+            wav,
             binarized_segmentations,
             exclude_overlap=self.embedding_exclude_overlap
         )
@@ -1545,9 +1343,8 @@ conv1d,layers.conv
             hard_clusters,
             count,
         )
-        diarization = self.to_annotation(
+        diarization = detect_segments(
             discrete_diarization,
-            min_duration_on=0.0,
         )
         count.data = np.minimum(count.data, 1).astype(np.int8)
         exclusive_discrete_diarization = self.reconstruct(
@@ -1555,7 +1352,7 @@ conv1d,layers.conv
             hard_clusters,
             count,
         )
-        exclusive_diarization = self.to_annotation(exclusive_discrete_diarization,)
+        exclusive_diarization = detect_segments(exclusive_discrete_diarization)
         mapping = {
             label: expected_label
             for label, expected_label in zip(diarization.labels(), self.classes())
