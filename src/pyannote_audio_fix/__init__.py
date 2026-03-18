@@ -7,10 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch_state_bridge as tb
 from string import ascii_uppercase
-from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Text, Tuple
+from typing import Optional, Tuple
 from tqdm import tqdm
 from einops import rearrange
 from huggingface_hub import hf_hub_download
@@ -256,10 +255,8 @@ class VBxClustering:
                 hard_clusters[c, s] = k
         return hard_clusters
 
-@dataclass
 class Specifications:
-    classes: Optional[List[Text]] = ['speaker#1', 'speaker#2', 'speaker#3']
-    powerset_max_classes: Optional[int] = 2
+    classes = ['speaker#1', 'speaker#2', 'speaker#3']
 
     @cached_property
     def num_powerset_classes(self) -> int:
@@ -272,7 +269,7 @@ class Specifications:
 
 
 class Powerset(nn.Module):
-    def __init__(self, num_classes: int, max_set_size: int):
+    def __init__(self, num_classes: int, max_set_size: int = 2):
         super().__init__()
         self.num_classes = num_classes
         self.max_set_size = max_set_size
@@ -325,9 +322,7 @@ class Powerset(nn.Module):
             num_classes=self.num_powerset_classes,
         )
 
-    def _permutation_powerset(
-        self, multilabel_permutation: Tuple[int, ...]
-    ) -> Tuple[int, ...]:
+    def _permutation_powerset(self, multilabel_permutation: Tuple[int, ...]):
         permutated_mapping: torch.Tensor = self.mapping[:, multilabel_permutation]
 
         arange = torch.arange(
@@ -347,7 +342,7 @@ class Powerset(nn.Module):
         return tuple(powerset_permutation.tolist())
 
     @cached_property
-    def permutation_mapping(self) -> Dict[Tuple[int, ...], Tuple[int, ...]]:
+    def permutation_mapping(self):
         permutation_mapping = {}
 
         for multilabel_permutation in itertools.permutations(
@@ -426,7 +421,7 @@ class PyanNet(nn.Module):
         self.lstm = nn.LSTM(60, 128, 4, bidirectional=True, batch_first=True)
         self.linears = nn.ModuleList([nn.Linear(128*2 if i==0 else 128, 128) for i in range(2)])
         self.classifier = nn.Linear(128, specifications.num_powerset_classes)
-        self.conversion = Powerset(len(specifications.classes), specifications.powerset_max_classes)
+        self.conversion = Powerset(len(specifications.classes))
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         outputs = rearrange(self.sincnet(waveforms), "batch feature frame -> batch frame feature")
@@ -461,7 +456,6 @@ class Inference:
         self.model = model
         specifications = model.specifications
         self.duration = 10.0
-        self.conversion = Powerset(len(specifications.classes), specifications.powerset_max_classes)
         self.skip_aggregation = True
         self.step = 0.1 * self.duration
         self.batch_size = 32
@@ -791,7 +785,6 @@ class SpeakerDiarization(nn.Module):
         segmentation_step: float = 0.1,
         embedding_exclude_overlap: bool = True,
         embedding_batch_size: int = 32,
-        der_variant: Optional[dict] = None,
     ):
         super().__init__()
         self._segmentation_model = PyanNet(specifications=Specifications())
@@ -800,7 +793,6 @@ class SpeakerDiarization(nn.Module):
         self.embedding_batch_size = embedding_batch_size
         self.embedding_exclude_overlap = embedding_exclude_overlap
         self._plda = PLDA(hf_hub_download("pyannote-community/speaker-diarization-community-1","plda/xvec_transform.npz"),hf_hub_download("pyannote-community/speaker-diarization-community-1","plda/plda.npz"))
-        self.der_variant = der_variant or {"collar": 0.0, "skip_overlap": False}
         self._segmentation = Inference(
             self._segmentation_model,
         )
