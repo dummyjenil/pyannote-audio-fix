@@ -7,7 +7,7 @@ authors = [
     { name = "Sheth Jenil", email = "shethjeniljigneshbhai@gmail.com" }
 ]
 
-dependencies = ["pyannote-core","pyannote-pipeline","tqdm","torchaudio","torch_state_bridge","safetensors","asteroid_filterbanks","scipy","scikit-learn","einops","torch","numpy"]
+dependencies = ["pyannote-core","tqdm","torchaudio","torch_state_bridge","safetensors","asteroid_filterbanks","scipy","scikit-learn","einops","torch","numpy"]
 
 [build-system]
 requires = ["uv_build>=0.10.10,<0.11.0"]

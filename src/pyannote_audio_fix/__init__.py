@@ -1,29 +1,24 @@
-# =========================
-# Standard Library Imports
-# =========================
 import itertools
 import math
-from string import ascii_uppercase
 import textwrap
 import warnings
-from dataclasses import dataclass
-from enum import Enum
-from functools import cached_property, lru_cache
-from io import IOBase
-from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Set, Text, Tuple, Union
-
-# =========================
-# Third-Party Imports
-# =========================
+import random
 import numpy as np
 import scipy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
+import torch_state_bridge as tb
+from string import ascii_uppercase
+from dataclasses import dataclass
+from enum import Enum
+from functools import cached_property, lru_cache
+from pathlib import Path
+from typing import Callable, Dict, List, Mapping, Optional, Text, Tuple, Union
+from tqdm import tqdm
 from einops import rearrange
 from huggingface_hub import hf_hub_download
-
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.linalg import eigh
 from scipy.optimize import linear_sum_assignment
@@ -32,14 +27,8 @@ from scipy.special import logsumexp, softmax
 from sklearn.cluster import KMeans
 from asteroid_filterbanks import Encoder, ParamSincFB
 from safetensors.torch import load_file
-import torch_state_bridge as tb
 from torch.utils.data import Dataset, DataLoader
-
-import torchaudio.compliance.kaldi as kaldi
-
-# =========================
-# Pyannote Imports
-# =========================
+from torchaudio.compliance.kaldi import fbank as kaldi_fbank
 from pyannote.core import (
     Annotation,
     Segment,
@@ -54,11 +43,6 @@ def string_generator(skip=None):
         for c in itertools.product(ascii_uppercase, repeat=r):
             if c not in skip: yield ''.join(c)
         r += 1
-
-import torchaudio
-from tqdm import tqdm
-
-AudioFile = str | Path | IOBase | Mapping
 
 def VBx(
     X,
@@ -314,9 +298,6 @@ class Specifications:
 
     @cached_property
     def num_powerset_classes(self) -> int:
-        # compute number of subsets of size at most "powerset_max_classes"
-        # e.g. with len(classes) = 3 and powerset_max_classes = 2:
-        # {}, {0}, {1}, {2}, {0, 1}, {0, 2}, {1, 2}
         return int(
             sum(
                 scipy.special.binom(len(self.classes), i)
@@ -586,22 +567,10 @@ class PyanNet(nn.Module):
         )
 
 
-def map_with_specifications(
-    specifications: Union[Specifications, Tuple[Specifications]],
-    func: Callable,
-    *iterables,
-):
-    if isinstance(specifications, Specifications):
-        return func(*iterables, specifications=specifications)
-    return tuple(
-        func(*i, specifications=s) for s, *i in zip(specifications, *iterables)
-    )
-
 class Inference:
     def __init__(
         self,
         model:PyanNet,
-        window: Text = "sliding",
         duration: Optional[float] = None,
         step: Optional[float] = None,
         pre_aggregation_hook: Callable[[np.ndarray], np.ndarray] = None,
@@ -611,84 +580,25 @@ class Inference:
     ):
         self.model = model
         specifications = self.model.specifications
-
-        # ~~~~ sliding window ~~~~~
-
-        if window not in ["sliding", "whole"]:
-            raise ValueError('`window` must be "sliding" or "whole".')
-
-        if window == "whole" and any(
-            s.resolution == Resolution.FRAME for s in specifications
-        ):
-            warnings.warn(
-                'Using "whole" `window` inference with a frame-based model might lead to bad results '
-                'and huge memory consumption: it is recommended to set `window` to "sliding".'
-            )
-        self.window = window
-
-        training_duration = next(iter(specifications)).duration
-        duration = duration or training_duration
-        if training_duration != duration:
-            warnings.warn(
-                f"Model was trained with {training_duration:g}s chunks, and you requested "
-                f"{duration:g}s chunks for inference: this might lead to suboptimal results."
-            )
         self.duration = duration
-
-        # ~~~~ powerset to multilabel conversion ~~~~
-
         self.skip_conversion = skip_conversion
-
-        conversion = list()
-        for s in specifications:
-            if s.powerset and not skip_conversion:
-                c = Powerset(len(s.classes), s.powerset_max_classes)
-                pass
-            else:
-                c = nn.Identity()
-            conversion.append(c)
-
+        conversion = [conversion.append(Powerset(len(s.classes), s.powerset_max_classes) if s.powerset and not skip_conversion else nn.Identity()) for s in specifications]
         if isinstance(specifications, Specifications):
             self.conversion = conversion[0]
         else:
             self.conversion = nn.ModuleList(conversion)
-
-        # ~~~~ overlap-add aggregation ~~~~~
-
         self.skip_aggregation = skip_aggregation
         self.pre_aggregation_hook = pre_aggregation_hook
-
         self.warm_up = next(iter(specifications)).warm_up
-        # Use that many seconds on the left- and rightmost parts of each chunk
-        # to warm up the model. While the model does process those left- and right-most
-        # parts, only the remaining central part of each chunk is used for aggregating
-        # scores during inference.
-
-        # step between consecutive chunks
         step = step or (
             0.1 * self.duration if self.warm_up[0] == 0.0 else self.warm_up[0]
         )
-
-        if step > self.duration:
-            raise ValueError(
-                f"Step between consecutive chunks is set to {step:g}s, while chunks are "
-                f"only {self.duration:g}s long, leading to gaps between consecutive chunks. "
-                f"Either decrease step or increase duration."
-            )
         self.step = step
-
         self.batch_size = batch_size
 
     def infer(self, chunks: torch.Tensor) -> Union[np.ndarray, Tuple[np.ndarray]]:
         with torch.inference_mode():
-            outputs = self.model(chunks)
-
-        def __convert(output: torch.Tensor, conversion: nn.Module, **kwargs):
-            return conversion(output).cpu().numpy()
-
-        return map_with_specifications(
-            self.model.specifications, __convert, outputs, self.conversion
-        )
+            return self.conversion(self.model(chunks)).cpu().numpy()
 
     def slide(
         self,
@@ -700,19 +610,8 @@ class Inference:
         window_size: int = self.model.audio.get_num_samples(self.duration)
         step_size: int = round(self.step * sample_rate)
         _, num_samples = waveform.shape
-
-        def __frames(
-            receptive_field, specifications: Optional[Specifications] = None
-        ) -> SlidingWindow:
-            if specifications.resolution == Resolution.CHUNK:
-                return SlidingWindow(start=0.0, duration=self.duration, step=self.step)
-            return receptive_field
-
-        frames: Union[SlidingWindow, Tuple[SlidingWindow]] = map_with_specifications(
-            self.model.specifications, __frames, self.model.receptive_field
-        )
-
-        # prepare complete chunks
+        specs = self.model.specifications
+        frames = SlidingWindow(0.0, self.duration, self.step) if specs.resolution == Resolution.CHUNK else self.model.receptive_field
         if num_samples >= window_size:
             chunks: torch.Tensor = rearrange(
                 waveform.unfold(1, window_size, step_size),
@@ -721,155 +620,62 @@ class Inference:
             num_chunks, _, _ = chunks.shape
         else:
             num_chunks = 0
-
-        # prepare last incomplete chunk
         has_last_chunk = (num_samples < window_size) or (
             num_samples - window_size
         ) % step_size > 0
         if has_last_chunk:
-            # pad last chunk with zeros
             last_chunk: torch.Tensor = waveform[:, num_chunks * step_size :]
             _, last_window_size = last_chunk.shape
             last_pad = window_size - last_window_size
             last_chunk = F.pad(last_chunk, (0, last_pad))
-
-        def __empty_list(**kwargs):
-            return list()
-
-        outputs: list[np.ndarray] | tuple[list[np.ndarray]] = (
-            map_with_specifications(self.model.specifications, __empty_list)
-        )
-
-        def __append_batch(output, batch_output, **kwargs) -> None:
-            output.append(batch_output)
-            return
-
-        # slide over audio chunks in batch
-        for c in tqdm(np.arange(0, num_chunks, self.batch_size)):
-            batch: torch.Tensor = chunks[c : c + self.batch_size]
-            batch = batch.to(device)
-            batch_outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(batch)
-
-            _ = map_with_specifications(
-                self.model.specifications, __append_batch, outputs, batch_outputs
-            )
-
-        # process orphan last chunk
+        outputs = []
+        for c in tqdm(range(0, num_chunks, self.batch_size)):
+            batch = chunks[c:c+self.batch_size].to(device)
+            batch_out = self.infer(batch)
+            outputs.append(batch_out)
         if has_last_chunk:
-            last_chunk = last_chunk.to(device)
-            last_outputs = self.infer(last_chunk[None])
-
-            _ = map_with_specifications(
-                self.model.specifications, __append_batch, outputs, last_outputs
-            )
-
-        def __vstack(output: List[np.ndarray], **kwargs) -> np.ndarray:
-            return np.vstack(output)
-
-        outputs: Union[np.ndarray, Tuple[np.ndarray]] = map_with_specifications(
-            self.model.specifications, __vstack, outputs
-        )
-
-        def __aggregate(
-            outputs: np.ndarray,
-            frames: SlidingWindow,
-            specifications: Optional[Specifications] = None,
-        ) -> SlidingWindowFeature:
-            # skip aggregation when requested,
-            # or when model outputs just one vector per chunk
-            # or when model is permutation-invariant (and not post-processed)
-            if (
-                self.skip_aggregation
-                or specifications.resolution == Resolution.CHUNK
-                or (
-                    specifications.permutation_invariant
-                    and self.pre_aggregation_hook is None
-                )
-            ):
-                frames = SlidingWindow(
-                    start=0.0, duration=self.duration, step=self.step
-                )
-                return SlidingWindowFeature(outputs, frames)
-
+            last_out = self.infer(last_chunk.to(device)[None])
+            outputs.append(last_out)
+        outputs = np.vstack(outputs)
+        if (
+            self.skip_aggregation
+            or specs.resolution == Resolution.CHUNK
+            or (specs.permutation_invariant and self.pre_aggregation_hook is None)
+        ):
+            frames = SlidingWindow(0.0, self.duration, self.step)
+            result = SlidingWindowFeature(outputs, frames)
+        else:
             if self.pre_aggregation_hook is not None:
                 outputs = self.pre_aggregation_hook(outputs)
-
-            aggregated = self.aggregate(
+            result = self.aggregate(
                 SlidingWindowFeature(
                     outputs,
-                    SlidingWindow(start=0.0, duration=self.duration, step=self.step),
+                    SlidingWindow(0.0, self.duration, self.step),
                 ),
                 frames,
                 warm_up=self.warm_up,
                 hamming=True,
                 missing=0.0,
             )
-
-            # remove padding that was added to last chunk
             if has_last_chunk:
-                aggregated.data = aggregated.crop(
+                result.data = result.crop(
                     Segment(0.0, num_samples / sample_rate), mode="loose"
                 )
-            return aggregated
-
-        return map_with_specifications(
-            self.model.specifications, __aggregate, outputs, frames
-        )
-
-    def __call__(self, file):
-        waveform, sample_rate = self.model.audio(file)
-        if self.window == "sliding":
-            return self.slide(waveform, sample_rate)
-        outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(waveform[None])
-        def __first_sample(outputs: np.ndarray, **kwargs) -> np.ndarray:
-            return outputs[0]
-        return map_with_specifications(
-            self.model.specifications, __first_sample, outputs
-        )
-
+        return result
     def crop(
         self,
         file,
         chunk: Union[Segment, List[Segment]],
-    ) -> Union[
-        Tuple[Union[SlidingWindowFeature, np.ndarray]],
-        Union[SlidingWindowFeature, np.ndarray],
-    ]:
-        if self.window == "sliding":
-            if not isinstance(chunk, Segment):
-                start = min(c.start for c in chunk)
-                end = max(c.end for c in chunk)
-                chunk = Segment(start=start, end=end)
-
-            waveform, sample_rate = self.model.audio.crop(file, chunk)
-            outputs: SlidingWindowFeature | tuple[SlidingWindowFeature] = (
-                self.slide(waveform, sample_rate)
-            )
-
-            def __shift(output: SlidingWindowFeature, **kwargs) -> SlidingWindowFeature:
-                frames = output.sliding_window
-                shifted_frames = SlidingWindow(
-                    start=chunk.start, duration=frames.duration, step=frames.step
-                )
-                return SlidingWindowFeature(output.data, shifted_frames)
-
-            return map_with_specifications(self.model.specifications, __shift, outputs)
-
-        if isinstance(chunk, Segment):
-            waveform, sample_rate = self.model.audio.crop(file, chunk)
-        else:
-            waveform = torch.cat(
-                [self.model.audio.crop(file, c)[0] for c in chunk], dim=1
-            )
-
-        outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(waveform[None])
-
-        def __first_sample(outputs: np.ndarray, **kwargs) -> np.ndarray:
-            return outputs[0]
-
-        return map_with_specifications(
-            self.model.specifications, __first_sample, outputs
-        )
+    ):
+        if not isinstance(chunk, Segment):
+            chunk = Segment(start=min(c.start for c in chunk), end=max(c.end for c in chunk))
+        waveform, sample_rate = self.model.audio.crop(file, chunk)
+        outputs = self.slide(waveform, sample_rate)
+        return SlidingWindowFeature(outputs.data, SlidingWindow(
+            start=chunk.start,
+            duration=outputs.sliding_window.duration,
+            step=outputs.sliding_window.step,
+        ))
 
     @staticmethod
     def aggregate(
@@ -1006,6 +812,9 @@ class Inference:
 
         return SlidingWindowFeature(new_data, new_chunks)
 
+    def __call__(self, file):
+        waveform, sample_rate = self.model.audio(file)
+        return self.slide(waveform, sample_rate)
 
 
 
@@ -1026,7 +835,6 @@ class Audio:
             if self.mono == "downmix":
                 waveform = waveform.mean(dim=0, keepdim=True)
             elif self.mono == "random":
-                import random
                 ch = random.randint(0, waveform.shape[0] - 1)
                 waveform = waveform[ch : ch + 1]
 
@@ -1247,166 +1055,99 @@ class PLDA:
     def __call__(self, emb: np.ndarray):
         return self._plda_tf(self._xvec_tf(emb), self.lda_dimension)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- Helper Functions ---
-def _pool(sequences: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    weights = weights.unsqueeze(dim=1)
-    v1 = weights.sum(dim=2) + 1e-8
-    mean = torch.sum(sequences * weights, dim=2) / v1
-    dx2 = torch.square(sequences - mean.unsqueeze(2))
-    v2 = torch.square(weights).sum(dim=2)
-    var = torch.sum(dx2 * weights, dim=2) / (v1 - v2 / v1 + 1e-8)
-    return torch.cat([mean, torch.sqrt(var)], dim=1)
-
-# --- Pooling Layers ---
-class StatsPool(nn.Module):
-    def forward(self, sequences: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if weights is None:
-            return torch.cat([sequences.mean(dim=-1), sequences.std(dim=-1, correction=1)], dim=-1)
-
-        if weights.dim() == 2:
-            weights, has_speaker = weights.unsqueeze(1), False
-        else:
-            has_speaker = True
-
-        if sequences.size(-1) != weights.size(-1):
-            weights = F.interpolate(weights, size=sequences.size(-1), mode="nearest")
-
-        output = torch.stack([_pool(sequences, weights[:, i, :]) for i in range(weights.size(1))], dim=1)
-        return output.squeeze(1) if not has_speaker else output
-
 class TSTP(nn.Module):
-    def __init__(self, in_dim=0, **kwargs):
+    def __init__(self, in_dim=0):
         super().__init__()
         self.in_dim = in_dim
-        self.stats_pool = StatsPool()
 
-    def forward(self, features, weights=None):
-        return self.stats_pool(rearrange(features, "b d c f -> b (d c) f"), weights)
+    def forward(self, features:torch.Tensor, weights=None):
+        x = rearrange(features, "b d c f -> b (d c) f")  # (B, D, T)
+        if weights is None:
+            return torch.cat(
+                [x.mean(dim=-1), x.std(dim=-1, correction=1)], dim=-1
+            )
+        if weights.dim() == 2:
+            weights, has_speaker = weights.unsqueeze(1), False  # (B,1,T)
+        else:
+            has_speaker = True  # (B,S,T)
+        if x.size(-1) != weights.size(-1):
+            weights = F.interpolate(weights, size=x.size(-1), mode="nearest")
+        w = weights.unsqueeze(2)                 # (B,S,1,T)
+        x_exp = x.unsqueeze(1)                   # (B,1,D,T)
+        v1 = w.sum(dim=-1) + 1e-8                # (B,S,1)
+        mean = (x_exp * w).sum(dim=-1) / v1      # (B,S,D)
+        dx2 = (x_exp - mean.unsqueeze(-1))**2    # (B,S,D,T)
+        v2 = (w**2).sum(dim=-1)                  # (B,S,1)
+        var = (dx2 * w).sum(dim=-1) / (v1 - v2 / v1 + 1e-8)  # (B,S,D)
+        out = torch.cat([mean, torch.sqrt(var)], dim=2)      # (B,S,2D)
+        return out.squeeze(1) if not has_speaker else out
 
-# --- ResNet Components ---
 class BasicBlock(nn.Module):
-    expansion = 1
     def __init__(self, in_planes, planes, stride=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, 3, stride=stride, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(in_planes, planes, 3, stride, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, 3, 1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(planes, planes, 3, 1, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, planes, 1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes)
-            )
+
+        self.shortcut = nn.Identity() if stride == 1 and in_planes == planes else nn.Sequential(
+            nn.Conv2d(in_planes, planes, 1, stride, bias=False),
+            nn.BatchNorm2d(planes)
+        )
 
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out)) + self.shortcut(x)
-        return F.relu(out)
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + self.shortcut(x))
 
 class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, m_channels=32, feat_dim=40, embed_dim=128, two_emb_layer=True):
+    def __init__(self):
         super().__init__()
-        self.in_planes, self.two_emb_layer = m_channels, two_emb_layer
-        self.conv1 = nn.Conv2d(1, m_channels, 3, 1, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(m_channels)
-        self.layer1 = self._make_layer(block, m_channels, num_blocks[0], 1)
-        self.layer2 = self._make_layer(block, m_channels * 2, num_blocks[1], 2)
-        self.layer3 = self._make_layer(block, m_channels * 4, num_blocks[2], 2)
-        self.layer4 = self._make_layer(block, m_channels * 8, num_blocks[3], 2)
-        stats_dim = (feat_dim // 8) * m_channels * 8 * block.expansion
-        self.pool = TSTP(in_dim=stats_dim) # Expandable for POOLING_LAYERS dict
-        self.seg_1 = nn.Linear(stats_dim*2, embed_dim)
-        self.seg_bn_1 = nn.BatchNorm1d(embed_dim, affine=False) if two_emb_layer else nn.Identity()
-        self.seg_2 = nn.Linear(embed_dim, embed_dim) if two_emb_layer else nn.Identity()
+        m, blocks = 32, [3, 4, 6, 3]
+        self.in_planes = m
 
-    def _make_layer(self, block, planes, num_blocks, stride):
-        layers = []
-        for s in [stride] + [1] * (num_blocks - 1):
-            layers.append(block(self.in_planes, planes, s))
-            self.in_planes = planes * block.expansion
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, m, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(m),
+            nn.ReLU()
+        )
+
+        self.layer1 = self._make_layer(m,   blocks[0], 1)
+        self.layer2 = self._make_layer(m*2, blocks[1], 2)
+        self.layer3 = self._make_layer(m*4, blocks[2], 2)
+        self.layer4 = self._make_layer(m*8, blocks[3], 2)
+
+        stats_dim = (80 // 8) * m * 8
+        self.pool = TSTP(stats_dim)
+        self.fc = nn.Linear(stats_dim * 2, 256)
+
+    def _make_layer(self, planes, n, stride):
+        layers = [BasicBlock(self.in_planes, planes, stride)]
+        self.in_planes = planes
+        layers += [BasicBlock(planes, planes) for _ in range(n - 1)]
         return nn.Sequential(*layers)
 
-    def forward_frames(self, fbank: torch.Tensor) -> torch.Tensor:
-        x = fbank.permute(0, 2, 1).unsqueeze(1)
-        out = F.relu(self.bn1(self.conv1(x)))
-        return self.layer4(self.layer3(self.layer2(self.layer1(out))))
+    def forward(self, x, weights=None):
+        x = x.permute(0, 2, 1).unsqueeze(1)
+        x = self.stem(x)
+        x = self.layer4(self.layer3(self.layer2(self.layer1(x))))
+        return self.fc(self.pool(x, weights=weights))
 
-    def forward_embedding(self, frames: torch.Tensor, weights: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        stats = self.pool(frames, weights=weights)
-        embed_a = self.seg_1(stats)
-        if self.two_emb_layer:
-            embed_b = self.seg_2(self.seg_bn_1(F.relu(embed_a)))
-            return embed_a, embed_b
-        return torch.tensor(0.0), embed_a
-
-    def forward(self, fbank: torch.Tensor, weights: Optional[torch.Tensor] = None):
-        frames = self.forward_frames(fbank)
-        return self.forward_embedding(frames, weights)
-
-# --- Main Model ---
 class WeSpeakerResNet34(nn.Module):
-    def __init__(self, sample_rate=16000, num_mel_bins=80, frame_length=25, frame_shift=10, **kwargs):
+    def __init__(self):
         super().__init__()
-        self.hparams = {
-            'sample_rate': sample_rate, 'num_mel_bins': num_mel_bins,
-            'frame_length': frame_length, 'frame_shift': frame_shift, **kwargs
-        }
-        self.resnet = ResNet(BasicBlock, [3, 4, 6, 3], feat_dim=num_mel_bins, embed_dim=256, two_emb_layer=False)
-        self.fbank_only = False
-        self.dimension = 256
-    def compute_fbank(self, waveforms: torch.Tensor) -> torch.Tensor:
-        waveforms = waveforms * (1 << 15)
-        device = waveforms.device
-        features = torch.vmap(kaldi.fbank)(
-            waveforms.unsqueeze(1),   # ← yahi fix hai
-            num_mel_bins=self.hparams['num_mel_bins'],
+        self.resnet = ResNet()
+
+    def forward(self, wav, weights=None):
+        wav = wav * (1 << 15)
+        feat = torch.vmap(kaldi_fbank)(
+            wav.unsqueeze(1),
+            num_mel_bins=80,
             window_type="hamming"
-        ).to(device)
-        return features - torch.mean(features, dim=1, keepdim=True)
+        ).to(wav.device)
 
-    def forward(self, waveforms: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
-        fbank = self.compute_fbank(waveforms)
-        if self.fbank_only: return fbank
-        return self.resnet(fbank, weights=weights)[1] # Returns embed_b
-
-    def forward_frames(self, waveforms: torch.Tensor) -> torch.Tensor:
-        return self.resnet.forward_frames(self.compute_fbank(waveforms))
-
-    def forward_embedding(self, frames: torch.Tensor, weights: torch.Tensor = None) -> torch.Tensor:
-        return self.resnet.forward_embedding(frames, weights=weights)[1]
-
+        feat = feat - feat.mean(dim=1, keepdim=True)
+        return self.resnet(feat, weights=weights)[1]
 
 
 
@@ -1533,7 +1274,6 @@ class SpeakerDiarization(nn.Module):
         segmentation_step: float = 0.1,
         embedding_exclude_overlap: bool = True,
         embedding_batch_size: int = 32,
-        segmentation_batch_size: int = 32,
         der_variant: Optional[dict] = None,
     ):
         super().__init__()
@@ -1550,7 +1290,6 @@ class SpeakerDiarization(nn.Module):
             duration=segmentation_duration,
             step=self.segmentation_step * segmentation_duration,
             skip_aggregation=True,
-            batch_size=segmentation_batch_size,
         )
 
         self._audio = Audio(16000, "downmix")
@@ -1637,11 +1376,8 @@ conv1d,layers.conv
             batch_size=self.embedding_batch_size,
             pin_memory=True,
         )
-
-        # --- Inference ---
-        # Preallocate karo — seedha sahi shape mein
         embeddings = np.zeros(
-            (num_chunks, num_speakers, self._embedding.dimension),
+            (num_chunks, num_speakers, self._embedding.resnet.fc.out_features),
             dtype=np.float32,
         )
 
@@ -1653,9 +1389,7 @@ conv1d,layers.conv
             waveforms = waveforms.to(device)  # (B, N) — sahi shape
             masks = masks.to(device)                        # (B, num_frames)
 
-            batch_embeddings = self._embedding(
-                waveforms, masks
-            )  # (B, dimension)
+            batch_embeddings = self._embedding(waveforms, masks)
             batch_embeddings = batch_embeddings.cpu().numpy()
             embeddings[chunk_idxs.numpy(), speaker_idxs.numpy()] = batch_embeddings
 
@@ -1751,7 +1485,7 @@ conv1d,layers.conv
     @torch.inference_mode()
     def forward(
         self,
-        file: AudioFile,
+        file,
         num_speakers: Optional[int] = None,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
@@ -1761,10 +1495,6 @@ conv1d,layers.conv
             min_speakers=min_speakers,
             max_speakers=max_speakers,
         )
-        if self._expects_num_speakers and num_speakers is None:
-            if isinstance(file, Mapping) and "annotation" in file:
-                num_speakers = len(file["annotation"].labels())
-
         segmentations = self._segmentation(file)
         if self._segmentation_model.specifications.powerset:
             binarized_segmentations = segmentations
