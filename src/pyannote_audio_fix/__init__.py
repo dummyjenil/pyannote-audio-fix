@@ -1,7 +1,6 @@
 import itertools
 import math
 import numpy as np
-import scipy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +30,8 @@ from pyannote.core import (
 )
 
 SAMPLE_RATE = 16000
+CLASSES = ['speaker#1', 'speaker#2', 'speaker#3']
+powerset_max_classes = 2
 
 
 def string_generator():
@@ -255,24 +256,13 @@ class VBxClustering:
                 hard_clusters[c, s] = k
         return hard_clusters
 
-class Specifications:
-    classes = ['speaker#1', 'speaker#2', 'speaker#3']
-    powerset_max_classes = 2
-    @cached_property
-    def num_powerset_classes(self) -> int:
-        return int(
-            sum(
-                scipy.special.binom(len(self.classes), i)
-                for i in range(0, self.powerset_max_classes + 1)
-            )
-        )
 
 
 class Powerset(nn.Module):
-    def __init__(self, num_classes: int, max_set_size: int = 2):
+    def __init__(self):
         super().__init__()
-        self.num_classes = num_classes
-        self.max_set_size = max_set_size
+        self.num_classes = len(CLASSES)
+        self.max_set_size = powerset_max_classes
         self.register_buffer("mapping", self.build_mapping(), persistent=False)
         self.register_buffer("cardinality", self.build_cardinality(), persistent=False)
 
@@ -417,12 +407,12 @@ class SincNet(nn.Module):
 class PyanNet(nn.Module):
     def __init__(self):
         super().__init__()
-        specifications = Specifications()
         self.sincnet = SincNet()
         self.lstm = nn.LSTM(60, 128, 4, bidirectional=True, batch_first=True)
         self.linears = nn.ModuleList([nn.Linear(128*2 if i==0 else 128, 128) for i in range(2)])
-        self.classifier = nn.Linear(128, specifications.num_powerset_classes)
-        self.conversion = Powerset(len(specifications.classes))
+        n = len(CLASSES)
+        self.classifier = nn.Linear(128, sum(math.comb(n, i) for i in range(0, powerset_max_classes + 1)))
+        self.conversion = Powerset()
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         outputs = rearrange(self.sincnet(waveforms), "batch feature frame -> batch frame feature")
