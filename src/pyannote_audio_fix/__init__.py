@@ -36,12 +36,11 @@ from pyannote.core import (
     SlidingWindowFeature,
 )
 
-def string_generator(skip=None):
-    skip = skip or []
+def string_generator():
     r = 1
     while True:
         for c in itertools.product(ascii_uppercase, repeat=r):
-            if c not in skip: yield ''.join(c)
+            yield ''.join(c)
         r += 1
 
 def VBx(
