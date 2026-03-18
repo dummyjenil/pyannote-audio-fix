@@ -415,8 +415,9 @@ class SincNet(nn.Module):
 
 # --- PyanNet ---
 class PyanNet(nn.Module):
-    def __init__(self,specifications:Specifications=None):
+    def __init__(self):
         super().__init__()
+        specifications = Specifications()
         self.sincnet = SincNet()
         self.lstm = nn.LSTM(60, 128, 4, bidirectional=True, batch_first=True)
         self.linears = nn.ModuleList([nn.Linear(128*2 if i==0 else 128, 128) for i in range(2)])
@@ -434,7 +435,7 @@ class PyanNet(nn.Module):
     def receptive_field_size(self, n=1): return self.sincnet.receptive_field_size(n)
     def receptive_field_center(self, f=0): return self.sincnet.receptive_field_center(f)
     @cached_property
-    def receptive_field(self) -> SlidingWindow:
+    def receptive_field(self):
         """(Internal) frames"""
 
         receptive_field_size = self.receptive_field_size()
@@ -454,7 +455,6 @@ class PyanNet(nn.Module):
 class Inference:
     def __init__(self,model:PyanNet):
         self.model = model
-        specifications = model.specifications
         self.duration = 10.0
         self.skip_aggregation = True
         self.step = 0.1 * self.duration
@@ -486,7 +486,7 @@ class Inference:
             outputs.append(self.model.conversion(self.model(chunks[c:c+self.batch_size].to(device))).cpu().numpy())
         if has_last_chunk:
             outputs.append(self.model.conversion(self.model(last_chunk[None].to(device))).cpu().numpy())
-        return SlidingWindowFeature(np.vstack(outputs), SlidingWindow(0.0, self.duration, self.step))
+        return SlidingWindowFeature(np.vstack(outputs), SlidingWindow(self.duration, self.step))
 
     @staticmethod
     def aggregate(
@@ -787,7 +787,7 @@ class SpeakerDiarization(nn.Module):
         embedding_batch_size: int = 32,
     ):
         super().__init__()
-        self._segmentation_model = PyanNet(specifications=Specifications())
+        self._segmentation_model = PyanNet()
         self._embedding = WeSpeakerResNet34()
         self.segmentation_step = segmentation_step
         self.embedding_batch_size = embedding_batch_size
@@ -805,7 +805,11 @@ linear,linears
 conv1d,layers.conv
 .norm1d,.layers.norm
 """))
-        self._embedding.load_state_dict(load_file(hf_hub_download("shethjenil/speaker-diarization","embedding.safetensors")))
+        self._embedding.load_state_dict(tb.state_bridge(load_file(hf_hub_download("shethjenil/speaker-diarization","embedding.safetensors")),"""
+resnet.conv1,resnet.stem.0
+resnet.bn1,resnet.stem.1
+resnet.seg_1,resnet.fc
+"""))
         self.eval()
 
     def classes(self):
