@@ -257,7 +257,7 @@ class VBxClustering:
 
 class Specifications:
     classes = ['speaker#1', 'speaker#2', 'speaker#3']
-
+    powerset_max_classes = 2
     @cached_property
     def num_powerset_classes(self) -> int:
         return int(
