@@ -577,20 +577,15 @@ class Inference:
 
 def detect_segments(scores:SlidingWindowFeature, onset=0.5, offset=None):
     offset = onset if offset is None else offset
-
     data = scores.data
     timestamps = [scores.sliding_window[i].middle for i in range(len(data))]
-
     result = Annotation()
     track_gen = string_generator()
-
     for i, cls_scores in enumerate(data.T):
         label = i if scores.labels is None else scores.labels[i]
         track = next(track_gen)
-
         active = cls_scores[0] > onset
         start = timestamps[0]
-
         for t, val in zip(timestamps[1:], cls_scores[1:]):
             if active and val < offset:
                 result[Segment(start, t), track] = label
