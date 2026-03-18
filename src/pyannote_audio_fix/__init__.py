@@ -1,7 +1,5 @@
 import itertools
 import math
-import textwrap
-import warnings
 import numpy as np
 import scipy
 import torch
@@ -10,10 +8,9 @@ import torch.nn.functional as F
 import torch_state_bridge as tb
 from string import ascii_uppercase
 from dataclasses import dataclass
-from enum import Enum
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Text, Tuple, Union
+from typing import Dict, List, Optional, Text, Tuple
 from tqdm import tqdm
 from einops import rearrange
 from huggingface_hub import hf_hub_download
@@ -35,6 +32,8 @@ from pyannote.core import (
 )
 
 SAMPLE_RATE = 16000
+
+
 def string_generator():
     r = 1
     while True:
@@ -115,7 +114,7 @@ def cluster_vbx(ahc_init, fea, Phi, Fa, Fb, maxIters=20, init_smoothing=7.0):
     qinit = np.zeros((len(ahc_init), ahc_init.max() + 1))
     qinit[range(len(ahc_init)), ahc_init.astype(int)] = 1.0
     qinit = qinit if init_smoothing < 0 else softmax(qinit * init_smoothing, axis=1)
-    gamma, pi, _, _, _ = VBx(
+    gamma, pi, _, = VBx(
         fea,
         Phi,
         Fa=Fa,
@@ -123,7 +122,6 @@ def cluster_vbx(ahc_init, fea, Phi, Fa, Fb, maxIters=20, init_smoothing=7.0):
         pi=qinit.shape[1],
         gamma=qinit,
         maxIters=maxIters,
-        return_model=True,
     )
     return gamma, pi
 
@@ -141,10 +139,10 @@ class VBxClustering:
     def __call__(
         self,
         embeddings: np.ndarray,
-        segmentations: SlidingWindowFeature | None = None,
-        num_clusters: int | None = None,
-        min_clusters: int | None = None,
-        max_clusters: int | None = None,
+        segmentations: SlidingWindowFeature,
+        num_clusters: int,
+        min_clusters: int,
+        max_clusters: int,
     ) -> np.ndarray:
         
         constrained_assignment = self.constrained_assignment
@@ -165,9 +163,7 @@ class VBxClustering:
         train_embeddings_normed = train_embeddings / np.linalg.norm(
             train_embeddings, axis=1, keepdims=True
         )
-        dendrogram = linkage(
-            train_embeddings_normed, method="centroid", metric="euclidean"
-        )
+        dendrogram = linkage(train_embeddings_normed, "centroid")
         ahc_clusters = fcluster(dendrogram, self.threshold, criterion="distance") - 1
         _, ahc_clusters = np.unique(ahc_clusters, return_inverse=True)
 
@@ -260,39 +256,10 @@ class VBxClustering:
                 hard_clusters[c, s] = k
         return hard_clusters
 
-class Resolution(Enum):
-    FRAME = 1  # model outputs a sequence of frames
-    CHUNK = 2  # model outputs just one vector for the whole chunk
-
-class Problem(Enum):
-    BINARY_CLASSIFICATION = 0
-    MONO_LABEL_CLASSIFICATION = 1
-    MULTI_LABEL_CLASSIFICATION = 2
-    REPRESENTATION = 3
-    REGRESSION = 4
-
 @dataclass
 class Specifications:
-    problem: Problem
-    resolution: Resolution
-    duration: float
-    min_duration: Optional[float] = None
-    warm_up: Optional[Tuple[float, float]] = (0.0, 0.0)
-    classes: Optional[List[Text]] = None
-    powerset_max_classes: Optional[int] = None
-    permutation_invariant: bool = False
-
-    @cached_property
-    def powerset(self) -> bool:
-        if self.powerset_max_classes is None:
-            return False
-
-        if self.problem != Problem.MONO_LABEL_CLASSIFICATION:
-            raise ValueError(
-                "`powerset_max_classes` only makes sense with multi-class classification problems."
-            )
-
-        return True
+    classes: Optional[List[Text]] = ['speaker#1', 'speaker#2', 'speaker#3']
+    powerset_max_classes: Optional[int] = 2
 
     @cached_property
     def num_powerset_classes(self) -> int:
@@ -302,10 +269,6 @@ class Specifications:
                 for i in range(0, self.powerset_max_classes + 1)
             )
         )
-    def __len__(self):
-        return 1
-    def __iter__(self):
-        yield self
 
 
 class Powerset(nn.Module):
@@ -399,36 +362,6 @@ class Powerset(nn.Module):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # --- Exact Logic Helpers ---
 def conv1d_num_frames(num_samples, kernel_size=5, stride=1, padding=0, dilation=1) -> int:
     return 1 + (num_samples + 2 * padding - dilation * (kernel_size - 1) - 1) // stride
@@ -489,15 +422,11 @@ class SincNet(nn.Module):
 class PyanNet(nn.Module):
     def __init__(self,specifications:Specifications=None):
         super().__init__()
-        self.specifications = specifications
         self.sincnet = SincNet()
         self.lstm = nn.LSTM(60, 128, 4, bidirectional=True, batch_first=True)
         self.linears = nn.ModuleList([nn.Linear(128*2 if i==0 else 128, 128) for i in range(2)])
-        self.classifier = nn.Linear(128, self.dimension)
-
-    @property
-    def dimension(self) -> int:
-        return self.specifications.num_powerset_classes if getattr(self.specifications, 'powerset', False) else len(self.specifications.classes)
+        self.classifier = nn.Linear(128, specifications.num_powerset_classes)
+        self.conversion = Powerset(len(specifications.classes), specifications.powerset_max_classes)
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         outputs = rearrange(self.sincnet(waveforms), "batch feature frame -> batch frame feature")
@@ -521,57 +450,27 @@ class PyanNet(nn.Module):
             self.receptive_field_center() - (receptive_field_size - 1) / 2
         )
         return SlidingWindow(
-            start=receptive_field_start / self.sincnet.sample_rate,
-            duration=receptive_field_size / self.sincnet.sample_rate,
-            step=receptive_field_step / self.sincnet.sample_rate,
+            start=receptive_field_start / SAMPLE_RATE,
+            duration=receptive_field_size / SAMPLE_RATE,
+            step=receptive_field_step / SAMPLE_RATE,
         )
 
 
 class Inference:
-    def __init__(
-        self,
-        model:PyanNet,
-        duration: Optional[float] = None,
-        step: Optional[float] = None,
-        pre_aggregation_hook: Callable[[np.ndarray], np.ndarray] = None,
-        skip_aggregation: bool = False,
-        skip_conversion: bool = False,
-        batch_size: int = 32,
-    ):
+    def __init__(self,model:PyanNet):
         self.model = model
-        specifications = self.model.specifications
-        self.duration = duration
-        self.skip_conversion = skip_conversion
-        conversion = [Powerset(len(s.classes), s.powerset_max_classes) if s.powerset and not skip_conversion else nn.Identity() for s in specifications]
-        if isinstance(specifications, Specifications):
-            self.conversion = conversion[0]
-        else:
-            self.conversion = nn.ModuleList(conversion)
-        self.skip_aggregation = skip_aggregation
-        self.pre_aggregation_hook = pre_aggregation_hook
-        self.warm_up = next(iter(specifications)).warm_up
-        step = step or (
-            0.1 * self.duration if self.warm_up[0] == 0.0 else self.warm_up[0]
-        )
-        self.step = step
-        self.batch_size = batch_size
+        specifications = model.specifications
+        self.duration = 10.0
+        self.conversion = Powerset(len(specifications.classes), specifications.powerset_max_classes)
+        self.skip_aggregation = True
+        self.step = 0.1 * self.duration
+        self.batch_size = 32
 
-    def infer(self, chunks: torch.Tensor) -> Union[np.ndarray, Tuple[np.ndarray]]:
-        with torch.inference_mode():
-            return self.conversion(self.model(chunks)).cpu().numpy()
-
-    def slide(
-        self,
-        waveform: torch.Tensor,
-        sample_rate: int,
-    ) -> Union[SlidingWindowFeature, Tuple[SlidingWindowFeature]]:
+    def __call__(self,waveform: torch.Tensor):
         device = next(self.model.parameters()).device
-        self.conversion.to(device)
-        window_size: int = self.duration * SAMPLE_RATE
-        step_size: int = round(self.step * sample_rate)
+        window_size: int = round(self.duration * SAMPLE_RATE)
+        step_size: int = round(self.step * SAMPLE_RATE)
         _, num_samples = waveform.shape
-        specs = self.model.specifications
-        frames = self.model.receptive_field
         if num_samples >= window_size:
             chunks: torch.Tensor = rearrange(
                 waveform.unfold(1, window_size, step_size),
@@ -590,44 +489,15 @@ class Inference:
             last_chunk = F.pad(last_chunk, (0, last_pad))
         outputs = []
         for c in tqdm(range(0, num_chunks, self.batch_size)):
-            batch = chunks[c:c+self.batch_size].to(device)
-            batch_out = self.infer(batch)
-            outputs.append(batch_out)
+            outputs.append(self.model.conversion(self.model(chunks[c:c+self.batch_size].to(device))).cpu().numpy())
         if has_last_chunk:
-            last_out = self.infer(last_chunk.to(device)[None])
-            outputs.append(last_out)
-        outputs = np.vstack(outputs)
-        if (
-            self.skip_aggregation
-            or specs.resolution == Resolution.CHUNK
-            or (specs.permutation_invariant and self.pre_aggregation_hook is None)
-        ):
-            frames = SlidingWindow(0.0, self.duration, self.step)
-            result = SlidingWindowFeature(outputs, frames)
-        else:
-            if self.pre_aggregation_hook is not None:
-                outputs = self.pre_aggregation_hook(outputs)
-            result = self.aggregate(
-                SlidingWindowFeature(
-                    outputs,
-                    SlidingWindow(0.0, self.duration, self.step),
-                ),
-                frames,
-                warm_up=self.warm_up,
-                hamming=True,
-                missing=0.0,
-            )
-            if has_last_chunk:
-                result.data = result.crop(
-                    Segment(0.0, num_samples / sample_rate), mode="loose"
-                )
-        return result
+            outputs.append(self.model.conversion(self.model(last_chunk[None].to(device))).cpu().numpy())
+        return SlidingWindowFeature(np.vstack(outputs), SlidingWindow(0.0, self.duration, self.step))
 
     @staticmethod
     def aggregate(
         scores: SlidingWindowFeature,
         frames: SlidingWindow,
-        warm_up: Tuple[float, float] = (0.0, 0.0),
         epsilon: float = 1e-12,
         hamming: bool = False,
         missing: float = np.nan,
@@ -641,32 +511,12 @@ class Inference:
             duration=frames.duration,
             step=frames.step,
         )
-
-        # Hamming window used for overlap-add aggregation
         hamming_window = (
             np.hamming(num_frames_per_chunk).reshape(-1, 1)
             if hamming
             else np.ones((num_frames_per_chunk, 1))
         )
-
-        # anything before warm_up_left (and after num_frames_per_chunk - warm_up_right)
-        # will not be used in the final aggregation
-
-        # warm-up windows used for overlap-add aggregation
         warm_up_window = np.ones((num_frames_per_chunk, 1))
-        # anything before warm_up_left will not contribute to aggregation
-        warm_up_left = round(
-            warm_up[0] / scores.sliding_window.duration * num_frames_per_chunk
-        )
-        warm_up_window[:warm_up_left] = epsilon
-        # anything after num_frames_per_chunk - warm_up_right either
-        warm_up_right = round(
-            warm_up[1] / scores.sliding_window.duration * num_frames_per_chunk
-        )
-        warm_up_window[num_frames_per_chunk - warm_up_right :] = epsilon
-
-        # aggregated_output[i] will be used to store the sum of all predictions
-        # for frame #i
         num_frames = (
             frames.closest_frame(
                 scores.sliding_window.start
@@ -721,49 +571,11 @@ class Inference:
             average = aggregated_output
         else:
             average = aggregated_output / np.maximum(overlapping_chunk_count, epsilon)
-
         average[aggregated_mask == 0.0] = missing
-
         return SlidingWindowFeature(average, frames)
 
-    @staticmethod
-    def trim(
-        scores: SlidingWindowFeature,
-        warm_up: Tuple[float, float] = (0.1, 0.1),
-    ) -> SlidingWindowFeature:
 
-        assert scores.data.ndim == 3, (
-            "Inference.trim expects (num_chunks, num_frames, num_classes)-shaped `scores`"
-        )
-        _, num_frames, _ = scores.data.shape
-
-        chunks = scores.sliding_window
-
-        num_frames_left = round(num_frames * warm_up[0])
-        num_frames_right = round(num_frames * warm_up[1])
-
-        num_frames_step = round(num_frames * chunks.step / chunks.duration)
-        if num_frames - num_frames_left - num_frames_right < num_frames_step:
-            warnings.warn(
-                f"Total `warm_up` is so large ({sum(warm_up) * 100:g}% of each chunk) "
-                f"that resulting trimmed scores does not cover a whole step ({chunks.step:g}s)"
-            )
-        new_data = scores.data[:, num_frames_left : num_frames - num_frames_right]
-
-        new_chunks = SlidingWindow(
-            start=chunks.start + warm_up[0] * chunks.duration,
-            step=chunks.step,
-            duration=(1 - warm_up[0] - warm_up[1]) * chunks.duration,
-        )
-
-        return SlidingWindowFeature(new_data, new_chunks)
-
-    def __call__(self, file):
-        waveform, sample_rate = self.model.audio(file)
-        return self.slide(waveform, sample_rate)
-
-
-def detect_segments(scores, onset=0.5, offset=None):
+def detect_segments(scores:SlidingWindowFeature, onset=0.5, offset=None):
     offset = onset if offset is None else offset
 
     data = scores.data
@@ -792,61 +604,16 @@ def detect_segments(scores, onset=0.5, offset=None):
 
     return result
 
-def set_num_speakers(
-    num_speakers: Optional[int] = None,
-    min_speakers: Optional[int] = None,
-    max_speakers: Optional[int] = None,
-):
-    min_speakers = num_speakers or min_speakers or 1
-    max_speakers = num_speakers or max_speakers or np.inf
-    if min_speakers == max_speakers:
-        num_speakers = min_speakers
-    return num_speakers, min_speakers, max_speakers
-
-def binarize(scores, onset=0.5, offset=None, initial_state=None):
-    offset = offset or onset
-    if isinstance(scores, SlidingWindowFeature):
-        data = scores.data
-        if data.ndim == 2:
-            num_frames, num_classes = data.shape
-            data = data.T
-        elif data.ndim == 3:
-            num_chunks, num_frames, num_classes = data.shape
-            data = data.reshape(num_chunks * num_classes, num_frames)
-        else:
-            raise ValueError("Invalid shape")
-        result = binarize(data, onset, offset, initial_state)
-        if scores.data.ndim == 2:
-            result = result.T
-        else:
-            result = result.reshape(num_chunks, num_frames, num_classes)
-        return SlidingWindowFeature(result.astype(float), scores.sliding_window)
-
-    # numpy case
-    elif isinstance(scores, np.ndarray):
-        batch_size, num_frames = scores.shape
-        scores = np.nan_to_num(scores)
-        if initial_state is None:
-            initial_state = scores[:, 0] >= 0.5 * (onset + offset)
-        if isinstance(initial_state, bool):
-            initial_state = np.full(batch_size, initial_state)
-        on = scores > onset
-        off = scores < offset
-        state = initial_state.copy()
-        result = np.zeros_like(scores, dtype=bool)
-        for t in range(num_frames):
-            state = np.where(on[:, t], True, np.where(off[:, t], False, state))
-            result[:, t] = state
-        return result
-    else:
-        raise TypeError("Unsupported type")
+def set_num_speakers(num=None, min_=None, max_=None):
+    min_ = num or min_ or 1
+    max_ = num or max_ or np.inf
+    return (min_, min_, max_) if min_ == max_ else (num, min_, max_)
 
 def batchify(iterable, batch_size: int = 32, fillvalue=None):
     return itertools.zip_longest(*[iter(iterable)] * batch_size, fillvalue=fillvalue)
 
 def l2_norm(x):
-    n = np.linalg.norm(x, axis=-1, keepdims=True)
-    return x / n
+    return x / np.linalg.norm(x, axis=-1, keepdims=True)
 
 def vbx_setup(t_npz, p_npz):
     t, p = np.load(t_npz), np.load(p_npz)
@@ -968,61 +735,6 @@ class WeSpeakerResNet34(nn.Module):
         return self.resnet(feat, weights=weights)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class EmbeddingDataset(Dataset):
     def __init__(
         self,
@@ -1051,14 +763,10 @@ class EmbeddingDataset(Dataset):
 
     def __getitem__(self, idx):
         chunk_idx, speaker_idx = self.indices[idx]
-
-        # Disk I/O nahi — seedha RAM se slice!
-        start_sample = round(
+        start_sample = int(
             self.sliding_window[chunk_idx].start * SAMPLE_RATE
         )
         end_sample = start_sample + self.window_size
-        
-        # Pad if needed (last chunk)
         waveform = self.waveform[:, start_sample:end_sample]  # (1, window_size)
         if waveform.shape[1] < self.window_size:
             waveform = F.pad(waveform, (0, self.window_size - waveform.shape[1]))
@@ -1091,19 +799,15 @@ class SpeakerDiarization(nn.Module):
         der_variant: Optional[dict] = None,
     ):
         super().__init__()
-        self._segmentation_model = PyanNet(specifications=Specifications(None,None, 10.0,classes=['speaker#1', 'speaker#2', 'speaker#3'], powerset_max_classes=2, permutation_invariant=True))
+        self._segmentation_model = PyanNet(specifications=Specifications())
         self._embedding = WeSpeakerResNet34()
         self.segmentation_step = segmentation_step
         self.embedding_batch_size = embedding_batch_size
         self.embedding_exclude_overlap = embedding_exclude_overlap
         self._plda = PLDA(hf_hub_download("pyannote-community/speaker-diarization-community-1","plda/xvec_transform.npz"),hf_hub_download("pyannote-community/speaker-diarization-community-1","plda/plda.npz"))
         self.der_variant = der_variant or {"collar": 0.0, "skip_overlap": False}
-        segmentation_duration = self._segmentation_model.specifications.duration
         self._segmentation = Inference(
             self._segmentation_model,
-            duration=segmentation_duration,
-            step=self.segmentation_step * segmentation_duration,
-            skip_aggregation=True,
         )
 
         self.clustering = VBxClustering(self._plda)
@@ -1116,13 +820,6 @@ conv1d,layers.conv
 """))
         self._embedding.load_state_dict(load_file(hf_hub_download("shethjenil/speaker-diarization","embedding.safetensors")))
         self.eval()
-    @property
-    def segmentation_batch_size(self) -> int:
-        return self._segmentation.batch_size
-
-    @segmentation_batch_size.setter
-    def segmentation_batch_size(self, batch_size: int):
-        self._segmentation.batch_size = batch_size
 
     def classes(self):
         speaker = 0
@@ -1217,9 +914,7 @@ conv1d,layers.conv
     ) -> SlidingWindowFeature:
         num_chunks, num_frames, _ = segmentations.data.shape
         num_clusters = np.max(hard_clusters) + 1
-        clustered_segmentations = np.nan * np.zeros(
-            (num_chunks, num_frames, num_clusters)
-        )
+        clustered_segmentations = np.full((num_chunks, num_frames, num_clusters), np.nan)
         for c, (cluster, (_, segmentation)) in enumerate(
             zip(hard_clusters, segmentations)
         ):
@@ -1266,11 +961,13 @@ conv1d,layers.conv
     def speaker_count(
         binarized_segmentations: SlidingWindowFeature,
         frames: SlidingWindow,
-        warm_up: Tuple[float, float] = (0.1, 0.1),
-    ) -> SlidingWindowFeature:
-        trimmed = Inference.trim(binarized_segmentations, warm_up=warm_up)
+    ):
         count = Inference.aggregate(
-            np.sum(trimmed, axis=-1, keepdims=True),
+            np.sum(SlidingWindowFeature(binarized_segmentations.data[:, : binarized_segmentations.data.shape[1]], SlidingWindow(
+            start=binarized_segmentations.sliding_window.start,
+            step=binarized_segmentations.sliding_window.step,
+            duration=binarized_segmentations.sliding_window.duration,
+        )), axis=-1, keepdims=True),
             frames,
             hamming=False,
             missing=0.0,
@@ -1287,56 +984,27 @@ conv1d,layers.conv
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
     ):
-        num_speakers, min_speakers, max_speakers = set_num_speakers(
-            num_speakers=num_speakers,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-        )
+        
         segmentations = self._segmentation(wav)
-        if self._segmentation_model.specifications.powerset:
-            binarized_segmentations = segmentations
-        else:
-            binarized_segmentations: SlidingWindowFeature = binarize(
-                segmentations,
-                initial_state=False,
-            )
-        count = self.speaker_count(
-            binarized_segmentations,
-            self._segmentation_model.receptive_field,
-            warm_up=(0.0, 0.0),
-        )
+        count = self.speaker_count(segmentations,self._segmentation_model.receptive_field,)
         if np.nanmax(count.data) == 0.0:
             return
 
         embeddings = self.get_embeddings(
             wav,
-            binarized_segmentations,
+            segmentations,
             exclude_overlap=self.embedding_exclude_overlap
         )
+        num_speakers, min_speakers, max_speakers = set_num_speakers(num_speakers,min_speakers,max_speakers)
         hard_clusters, _, centroids = self.clustering(
             embeddings=embeddings,
-            segmentations=binarized_segmentations,
+            segmentations=segmentations,
             num_clusters=num_speakers,
             min_clusters=min_speakers,
             max_clusters=max_speakers,
         )
-        num_different_speakers = np.max(hard_clusters) + 1
-        if (
-            num_different_speakers < min_speakers
-            or num_different_speakers > max_speakers
-        ):
-            warnings.warn(
-                textwrap.dedent(
-                    f"""
-                The detected number of speakers ({num_different_speakers}) for {file["uri"]} is outside
-                the given bounds [{min_speakers}, {max_speakers}]. This can happen if the
-                given audio file is too short to contain {min_speakers} or more speakers.
-                Try to lower the desired minimal number of speakers.
-                """
-                )
-            )
         count.data = np.minimum(count.data, max_speakers).astype(np.int8)
-        inactive_speakers = np.sum(binarized_segmentations.data, axis=1) == 0
+        inactive_speakers = np.sum(segmentations.data, axis=1) == 0
         hard_clusters[inactive_speakers] = -2
         discrete_diarization = self.reconstruct(
             segmentations,
@@ -1346,7 +1014,8 @@ conv1d,layers.conv
         diarization = detect_segments(
             discrete_diarization,
         )
-        count.data = np.minimum(count.data, 1).astype(np.int8)
+        if max_speakers != np.inf:
+            count.data = np.minimum(count.data, max_speakers).astype(np.int8)
         exclusive_discrete_diarization = self.reconstruct(
             segmentations,
             hard_clusters,
